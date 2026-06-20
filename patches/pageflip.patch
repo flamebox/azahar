@@ -1,0 +1,565 @@
+--- a/src/common/serial_sync.h	1970-01-01 00:00:00.000000000 +0000
++++ b/src/common/serial_sync.h	2026-06-20 02:20:53.521275564 +0000
+@@ -0,0 +1,72 @@
++// Copyright Azahar Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#pragma once
++
++#include <atomic>
++#include <mutex>
++#include <string>
++
++namespace Common {
++
++/**
++ * Cross-platform serial port for 3D IR emitter sync.
++ * Used by Active Shutter 3D glasses (Xpand / NVIDIA 3D Vision / DLP Link compatible).
++ *
++ * Sends a single byte ('L' or 'R') before each page-flip frame so the
++ * external Arduino IR emitter can fire sync pulses to the 3D glasses.
++ *
++ * Thread-safe.
++ *
++ * Usage:
++ *   auto& sync = SerialSync3D::GetInstance();
++ *   sync.Open("COM3", 115200);        // optional: opens at startup
++ *   sync.SendEyeSignal(false);         // send 'L' for left-eye frame
++ *   sync.SendEyeSignal(true);          // send 'R' for right-eye frame
++ *   sync.Close();                      // optional: closes at shutdown
++ */
++class SerialSync3D {
++public:
++    /// Get the global singleton instance.
++    static SerialSync3D& GetInstance();
++
++    /// Open the serial port. Returns true on success, false on failure.
++    /// If port_name is empty, uses the value from settings (pageflip_serial_port).
++    /// If already open, returns true immediately.
++    bool Open(const std::string& port_name = "", int baud_rate = 0);
++
++    /// Close the serial port.
++    void Close();
++
++    /// Send a sync signal for the given eye.
++    /// is_right_eye = false -> 'L', true -> 'R'
++    /// No-op if the port isn't open or disabled by empty port name.
++    void SendEyeSignal(bool is_right_eye);
++
++    /// Check if the port is currently open.
++    bool IsOpen() const { return is_open_.load(); }
++
++    /// Get the last error message (empty if no error).
++    std::string GetLastError() const;
++
++private:
++    SerialSync3D() = default;
++    ~SerialSync3D();
++
++    SerialSync3D(const SerialSync3D&) = delete;
++    SerialSync3D& operator=(const SerialSync3D&) = delete;
++
++    // Platform-specific handle.
++    // Windows: HANDLE (cast through void*)
++    // POSIX:   int fd (cast through intptr_t)
++    void* handle_ = nullptr;
++
++    std::atomic<bool> is_open_{false};
++    std::atomic<bool> open_failed_{false};
++    mutable std::mutex send_mutex_;
++    mutable std::mutex error_mutex_;
++    std::string last_error_;
++};
++
++} // namespace Common
+\ No newline at end of file
+--- a/src/common/serial_sync.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/src/common/serial_sync.cpp	2026-06-20 02:22:08.237460943 +0000
+@@ -0,0 +1,204 @@
++// Copyright Azahar Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#include "common/serial_sync.h"
++#include "common/logging/log.h"
++
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include <fcntl.h>
++#include <termios.h>
++#include <unistd.h>
++#include <cerrno>
++#include <cstring>
++#endif
++
++namespace Common {
++
++SerialSync3D& SerialSync3D::GetInstance() {
++    static SerialSync3D instance;
++    return instance;
++}
++
++SerialSync3D::~SerialSync3D() {
++    Close();
++}
++
++bool SerialSync3D::Open(const std::string& port_name, int baud_rate) {
++    if (is_open_.load()) {
++        return true;
++    }
++
++    // If port name is empty, sync is disabled (no error).
++    if (port_name.empty()) {
++        return false;  // disabled by configuration
++    }
++    if (baud_rate <= 0) {
++        baud_rate = 115200;
++    }
++
++    const std::string& actual_port = port_name;
++
++    std::lock_guard<std::mutex> lock(send_mutex_);
++
++#ifdef _WIN32
++    HANDLE h = CreateFileA(
++        actual_port.c_str(),
++        GENERIC_WRITE,
++        0,
++        nullptr,
++        OPEN_EXISTING,
++        0,
++        nullptr
++    );
++
++    if (h == INVALID_HANDLE_VALUE) {
++        DWORD err = GetLastError();
++        std::lock_guard<std::mutex> err_lock(error_mutex_);
++        last_error_ = "CreateFileA(" + actual_port + ") failed (error " + std::to_string(err) + ")";
++        LOG_ERROR(Common, "SerialSync3D: {}", last_error_);
++        open_failed_.store(true);
++        return false;
++    }
++
++    DCB dcb{};
++    dcb.DCBlength = sizeof(dcb);
++    if (!GetCommState(h, &dcb)) {
++        std::lock_guard<std::mutex> err_lock(error_mutex_);
++        last_error_ = "GetCommState failed";
++        LOG_ERROR(Common, "SerialSync3D: {}", last_error_);
++        CloseHandle(h);
++        open_failed_.store(true);
++        return false;
++    }
++
++    dcb.BaudRate = static_cast<DWORD>(baud_rate);
++    dcb.ByteSize = 8;
++    dcb.StopBits = ONESTOPBIT;
++    dcb.Parity = NOPARITY;
++    dcb.fRtsControl = RTS_CONTROL_DISABLE;
++    dcb.fDtrControl = DTR_CONTROL_DISABLE;
++
++    if (!SetCommState(h, &dcb)) {
++        std::lock_guard<std::mutex> err_lock(error_mutex_);
++        last_error_ = "SetCommState failed";
++        LOG_ERROR(Common, "SerialSync3D: {}", last_error_);
++        CloseHandle(h);
++        open_failed_.store(true);
++        return false;
++    }
++
++    // Set short timeouts for non-blocking writes.
++    // 1ms timeout prevents stalls if device is disconnected.
++    COMMTIMEOUTS timeouts{};
++    timeouts.WriteTotalTimeoutConstant = 1;
++    timeouts.WriteTotalTimeoutMultiplier = 0;
++    SetCommTimeouts(h, &timeouts);
++
++    handle_ = static_cast<void*>(h);
++#else
++    int fd = ::open(actual_port.c_str(), O_WRONLY | O_NOCTTY | O_NDELAY);
++    if (fd < 0) {
++        std::lock_guard<std::mutex> err_lock(error_mutex_);
++        last_error_ = std::string("open(") + actual_port + ") failed: " + std::strerror(errno);
++        LOG_ERROR(Common, "SerialSync3D: {}", last_error_);
++        open_failed_.store(true);
++        return false;
++    }
++
++    struct termios options;
++    if (tcgetattr(fd, &options) != 0) {
++        std::lock_guard<std::mutex> err_lock(error_mutex_);
++        last_error_ = "tcgetattr failed";
++        LOG_ERROR(Common, "SerialSync3D: {}", last_error_);
++        ::close(fd);
++        open_failed_.store(true);
++        return false;
++    }
++
++    speed_t speed = B115200;
++    switch (baud_rate) {
++    case 9600:   speed = B9600; break;
++    case 19200:  speed = B19200; break;
++    case 38400:  speed = B38400; break;
++    case 57600:  speed = B57600; break;
++    case 115200: speed = B115200; break;
++    default:     speed = B115200; break;
++    }
++
++    cfsetispeed(&options, speed);
++    cfsetospeed(&options, speed);
++    options.c_cflag |= (CLOCAL | CREAD);
++    options.c_cflag &= ~PARENB;
++    options.c_cflag &= ~CSTOPB;
++    options.c_cflag &= ~CSIZE;
++    options.c_cflag |= CS8;
++    options.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
++    options.c_iflag &= ~(IXON | IXOFF | IXANY);
++    options.c_oflag &= ~OPOST;
++
++    if (tcsetattr(fd, TCSANOW, &options) != 0) {
++        std::lock_guard<std::mutex> err_lock(error_mutex_);
++        last_error_ = "tcsetattr failed";
++        LOG_ERROR(Common, "SerialSync3D: {}", last_error_);
++        ::close(fd);
++        open_failed_.store(true);
++        return false;
++    }
++
++    handle_ = reinterpret_cast<void*>(static_cast<intptr_t>(fd));
++#endif
++
++    is_open_.store(true);
++    open_failed_.store(false);
++    LOG_INFO(Common, "SerialSync3D: Opened {} at {} baud for 3D sync", actual_port, baud_rate);
++    return true;
++}
++
++void SerialSync3D::Close() {
++    if (!is_open_.load()) {
++        return;
++    }
++
++    std::lock_guard<std::mutex> lock(send_mutex_);
++
++#ifdef _WIN32
++    if (handle_) {
++        CloseHandle(static_cast<HANDLE>(handle_));
++    }
++#else
++    if (handle_) {
++        int fd = static_cast<int>(reinterpret_cast<intptr_t>(handle_));
++        ::close(fd);
++    }
++#endif
++    handle_ = nullptr;
++    is_open_.store(false);
++    LOG_INFO(Common, "SerialSync3D: Closed serial port");
++}
++
++void SerialSync3D::SendEyeSignal(bool is_right_eye) {
++    if (!is_open_.load() || !handle_) {
++        return;
++    }
++
++    const char cmd = is_right_eye ? 'R' : 'L';
++
++#ifdef _WIN32
++    DWORD written = 0;
++    WriteFile(static_cast<HANDLE>(handle_), &cmd, 1, &written, nullptr);
++#else
++    int fd = static_cast<int>(reinterpret_cast<intptr_t>(handle_));
++    ssize_t n = ::write(fd, &cmd, 1);
++    (void)n;
++#endif
++}
++
++std::string SerialSync3D::GetLastError() const {
++    std::lock_guard<std::mutex> lock(error_mutex_);
++    return last_error_;
++}
++
++} // namespace Common
+\ No newline at end of file
+--- a/src/common/settings.h	2026-06-19 21:56:06.000000000 +0000
++++ b/src/common/settings.h	2026-06-20 02:19:01.379972314 +0000
+@@ -88,7 +88,11 @@
+     Anaglyph = 3,
+     Interlaced = 4,
+     ReverseInterlaced = 5,
+-    CardboardVR = 6
++    CardboardVR = 6,
++    // Page-flip mode for active shutter 3D glasses (Xpand / NVIDIA 3D Vision / DLP Link).
++    // Renders each frame's left-eye and right-eye at 120Hz sequentially.
++    // Sends sync signal to external IR emitter via serial port.
++    PageFlip = 7
+ };
+ 
+ // Which eye to render when 3d is off. 800px wide mode could be added here in the future, when
+@@ -610,6 +614,16 @@
+ 
+     SwitchableSetting<StereoWhichDisplay> render_3d_which_display{StereoWhichDisplay::None,
+                                                                   Keys::render_3d_which_display};
++
++    // === Page-flip active shutter 3D settings ===
++    // Serial port name (e.g., "COM3") for IR emitter sync.
++    // Empty string disables the sync signal.
++    SwitchableSetting<std::string> pageflip_serial_port{"COM3", Keys::pageflip_serial_port};
++    // Baud rate for the serial sync. 115200 is reliable for 120Hz updates.
++    SwitchableSetting<int> pageflip_serial_baud{115200, Keys::pageflip_serial_baud};
++    // Force display to this refresh rate when PageFlip is enabled (Hz).
++    // Set to 0 to disable force (use current display rate).
++    SwitchableSetting<int> pageflip_target_refresh{120, Keys::pageflip_target_refresh};
+     SwitchableSetting<MonoRenderOption> mono_render_option{MonoRenderOption::LeftEye,
+                                                            Keys::mono_render_option};
+ 
+--- a/src/common/settings.cpp	2026-06-19 21:56:06.000000000 +0000
++++ b/src/common/settings.cpp	2026-06-20 02:23:19.360385101 +0000
+@@ -117,6 +117,9 @@
+     log_setting("Stereoscopy_Render_3d_to_which_display",
+                 values.render_3d_which_display.GetValue());
+     log_setting("Stereoscopy_MonoRenderOption", values.mono_render_option.GetValue());
++    log_setting("Stereoscopy_PageFlipSerialPort", values.pageflip_serial_port.GetValue());
++    log_setting("Stereoscopy_PageFlipSerialBaud", values.pageflip_serial_baud.GetValue());
++    log_setting("Stereoscopy_PageFlipTargetRefresh", values.pageflip_target_refresh.GetValue());
+     if (values.render_3d.GetValue() == StereoRenderOption::Anaglyph) {
+         log_setting("Renderer_AnaglyphShader", values.anaglyph_shader_name.GetValue());
+     }
+@@ -237,6 +240,9 @@
+     values.render_3d.SetGlobal(true);
+     values.swap_eyes_3d.SetGlobal(true);
+     values.factor_3d.SetGlobal(true);
++    values.pageflip_serial_port.SetGlobal(true);
++    values.pageflip_serial_baud.SetGlobal(true);
++    values.pageflip_target_refresh.SetGlobal(true);
+     values.filter_mode.SetGlobal(true);
+     values.pp_shader_name.SetGlobal(true);
+     values.anaglyph_shader_name.SetGlobal(true);
+--- a/src/common/CMakeLists.txt	2026-06-19 21:56:06.000000000 +0000
++++ b/src/common/CMakeLists.txt	2026-06-20 02:22:52.078685121 +0000
+@@ -71,6 +71,8 @@
+     scm_rev.cpp
+     scm_rev.h
+     scope_exit.h
++    serial_sync.cpp
++    serial_sync.h
+     setting_keys.h
+     settings.cpp
+     settings.h
+--- a/CMakeModules/GenerateSettingKeys.cmake	2026-06-19 21:56:06.000000000 +0000
++++ b/CMakeModules/GenerateSettingKeys.cmake	2026-06-20 02:20:30.113805426 +0000
+@@ -90,6 +90,9 @@
+     "swap_eyes_3d"
+     "render_3d_which_display"
+     "mono_render_option"
++    "pageflip_serial_port"
++    "pageflip_serial_baud"
++    "pageflip_target_refresh"
+     "cardboard_screen_size"
+     "cardboard_x_shift"
+     "cardboard_y_shift"
+--- a/src/video_core/renderer_opengl/renderer_opengl.cpp	2026-06-19 21:56:06.000000000 +0000
++++ b/src/video_core/renderer_opengl/renderer_opengl.cpp	2026-06-20 02:26:55.458551467 +0000
+@@ -4,6 +4,7 @@
+ 
+ #include "common/logging/log.h"
+ #include "common/microprofile.h"
++#include "common/serial_sync.h"
+ #include "common/settings.h"
+ #include "core/core.h"
+ #include "core/frontend/emu_window.h"
+@@ -86,7 +87,12 @@
+     InitOpenGLObjects();
+ }
+ 
+-RendererOpenGL::~RendererOpenGL() = default;
++RendererOpenGL::~RendererOpenGL() {
++    // Close serial port if it was opened for page-flip sync
++    if (pageflip_serial_ready_) {
++        Common::SerialSync3D::GetInstance().Close();
++    }
++}
+ 
+ void RendererOpenGL::SwapBuffers() {
+     system.perf_stats->StartSwap();
+@@ -98,35 +104,50 @@
+ 
+     PrepareRendertarget();
+     RenderScreenshot();
++
++    const auto& main_layout = render_window.GetFramebufferLayout();
++    const auto render_mode = main_layout.render_3d_mode;
++
+ #ifdef HAVE_LIBRETRO
+     DrawScreens(render_window.GetFramebufferLayout(), false);
+     render_window.SwapBuffers();
+ #else
+-    const auto& main_layout = render_window.GetFramebufferLayout();
+-    RenderToMailbox(main_layout, render_window.mailbox, false);
++    if (render_mode == Settings::StereoRenderOption::PageFlip) {
++        // ============================================================
++        // Page-flip mode for active shutter 3D glasses.
++        // Each 3DS frame, render twice: first L (full screen), then R.
++        // Send 'L'/'R' sync byte via serial before each present.
++        // The mailbox GetRenderFrame() will naturally throttle to vsync.
++        // ============================================================
++        DoPageFlipPresent(main_layout, /*is_right_eye=*/false);
++        DoPageFlipPresent(main_layout, /*is_right_eye=*/true);
++    } else {
++        // Normal path
++        RenderToMailbox(main_layout, render_window.mailbox, false);
+ 
+ #ifdef ANDROID
+-    // On Android, if secondary_window is defined at all,
+-    // it means we have a second display
+-    if (secondary_window) {
+-        const auto& secondary_layout = secondary_window->GetFramebufferLayout();
+-        RenderToMailbox(secondary_layout, secondary_window->mailbox, false);
+-        secondary_window->PollEvents();
+-    }
++        // On Android, if secondary_window is defined at all,
++        // it means we have a second display
++        if (secondary_window) {
++            const auto& secondary_layout = secondary_window->GetFramebufferLayout();
++            RenderToMailbox(secondary_layout, secondary_window->mailbox, false);
++            secondary_window->PollEvents();
++        }
+ #else
+-    if (Settings::values.layout_option.GetValue() == Settings::LayoutOption::SeparateWindows) {
+-        ASSERT(secondary_window);
+-        const auto& secondary_layout = secondary_window->GetFramebufferLayout();
+-        RenderToMailbox(secondary_layout, secondary_window->mailbox, false);
+-        secondary_window->PollEvents();
+-    }
++        if (Settings::values.layout_option.GetValue() == Settings::LayoutOption::SeparateWindows) {
++            ASSERT(secondary_window);
++            const auto& secondary_layout = secondary_window->GetFramebufferLayout();
++            RenderToMailbox(secondary_layout, secondary_window->mailbox, false);
++            secondary_window->PollEvents();
++        }
+ #endif
+ 
+-    if (frame_dumper.IsDumping()) {
+-        try {
+-            RenderToMailbox(frame_dumper.GetLayout(), frame_dumper.mailbox, true);
+-        } catch (const OGLTextureMailboxException& exception) {
+-            LOG_DEBUG(Render_OpenGL, "Frame dumper exception caught: {}", exception.what());
++        if (frame_dumper.IsDumping()) {
++            try {
++                RenderToMailbox(frame_dumper.GetLayout(), frame_dumper.mailbox, true);
++            } catch (const OGLTextureMailboxException& exception) {
++                LOG_DEBUG(Render_OpenGL, "Frame dumper exception caught: {}", exception.what());
++            }
+         }
+     }
+ #endif
+@@ -137,6 +158,37 @@
+     rasterizer.TickFrame();
+ }
+ 
++void RendererOpenGL::DoPageFlipPresent(const Layout::FramebufferLayout& layout,
++                                       bool is_right_eye) {
++    using Common::SerialSync3D;
++
++    // Lazy-init serial port on first page-flip frame
++    if (!pageflip_serial_ready_) {
++        const std::string& port_name = Settings::values.pageflip_serial_port.GetValue();
++        const int baud = Settings::values.pageflip_serial_baud.GetValue();
++        if (!port_name.empty()) {
++            pageflip_serial_ready_ = SerialSync3D::GetInstance().Open(port_name, baud);
++        } else {
++            pageflip_serial_ready_ = true;  // disabled, mark ready so we don't spam log
++        }
++    }
++
++    // Send sync signal to Arduino BEFORE rendering, so IR fires just before VSync.
++    SerialSync3D::GetInstance().SendEyeSignal(is_right_eye);
++
++    // Update state for DrawScreens to pick correct eye
++    pageflip_current_eye_ = is_right_eye;
++    pageflip_frame_count_++;
++
++    // Render to mailbox. The mailbox's GetRenderFrame() will wait for the
++    // previous present to complete, naturally pacing us to 120Hz.
++    RenderToMailbox(layout, render_window.mailbox, /*flipped=*/false);
++
++    // Force GPU to finish commands before the next present.
++    // This ensures tight vsync-aligned timing.
++    glFinish();
++}
++
+ void RendererOpenGL::RenderScreenshot() {
+     if (settings.screenshot_requested.exchange(false)) {
+         // Draw this frame to the screenshot framebuffer
+@@ -754,6 +806,14 @@
+                          top_screen_height, orientation);
+         break;
+     }
++    case Settings::StereoRenderOption::PageFlip: {
++        // Render ONLY the current eye at full screen.
++        // The other eye is rendered in the next DoPageFlipPresent call.
++        const int eye = pageflip_current_eye_ ? 1 : 0;  // 0=L, 1=R
++        DrawSingleScreen(screen_infos[eye], top_screen_left, top_screen_top, top_screen_width,
++                         top_screen_height, orientation);
++        break;
++    }
+     case Settings::StereoRenderOption::SideBySide: {
+         DrawSingleScreen(screen_infos[leftside], top_screen_left / 2, top_screen_top,
+                          top_screen_width / 2, top_screen_height, orientation);
+@@ -811,6 +871,12 @@
+         DrawSingleScreen(screen_infos[2], bottom_screen_left, bottom_screen_top,
+                          bottom_screen_width, bottom_screen_height, orientation);
+         break;
++    }
++    case Settings::StereoRenderOption::PageFlip: {
++        // Bottom screen is mono (no L/R difference).
++        DrawSingleScreen(screen_infos[2], bottom_screen_left, bottom_screen_top,
++                         bottom_screen_width, bottom_screen_height, orientation);
++        break;
+     }
+     case Settings::StereoRenderOption::SideBySide: // Bottom screen is identical on both sides
+     {
+--- a/src/video_core/renderer_opengl/renderer_opengl.h	2026-06-19 21:56:06.000000000 +0000
++++ b/src/video_core/renderer_opengl/renderer_opengl.h	2026-06-20 02:24:14.622601613 +0000
+@@ -67,6 +67,10 @@
+     void DrawScreens(const Layout::FramebufferLayout& layout, bool flipped);
+     void ApplySecondLayerOpacity(float opacity = 1.0f);
+     void ResetSecondLayerOpacity();
++
++    /// Page-flip rendering: render current 3DS frame's eye (L or R) at full screen.
++    /// Called twice per 3DS frame when PageFlip mode is active.
++    void DoPageFlipPresent(const Layout::FramebufferLayout& layout, bool is_right_eye);
+     void DrawBottomScreen(const Layout::FramebufferLayout& layout,
+                           const Common::Rectangle<u32>& bottom_screen);
+     void DrawTopScreen(const Layout::FramebufferLayout& layout,
+@@ -112,6 +116,15 @@
+     GLuint attrib_tex_coord;
+ 
+     FrameDumperOpenGL frame_dumper;
++
++    // === Page-flip active shutter 3D state ===
++    // Which eye is currently being rendered (false = L, true = R).
++    // Alternates each present at 120Hz.
++    bool pageflip_current_eye_ = false;
++    // Whether the serial port was successfully opened at boot.
++    bool pageflip_serial_ready_ = false;
++    // Frame counter for diagnostics.
++    u64 pageflip_frame_count_ = 0;
+ };
+ 
+ } // namespace OpenGL
+--- a/src/citra_qt/configuration/configure_enhancements.ui	2026-06-19 21:56:06.000000000 +0000
++++ b/src/citra_qt/configuration/configure_enhancements.ui	2026-06-20 02:26:33.244205847 +0000
+@@ -264,6 +264,11 @@
+             <string>Reverse Interlaced</string>
+            </property>
+           </item>
++          <item>
++           <property name="text">
++            <string>Page Flip (Active Shutter 3D)</string>
++           </property>
++          </item>
+          </widget>
+         </item>
+        </layout>
