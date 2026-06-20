@@ -1,9 +1,11 @@
 # Azahar Page-Flip 3D 专用构建工作流
 #
 # 用法：
-# 1. 把这个文件放到你的 Azahar fork 的 .github/workflows/ 目录
-# 2. 推送代码触发自动构建
-# 3. 在 Actions 页面下载 .exe
+# 1. Fork Azahar (https://github.com/azahar-emu/azahar)
+# 2. 在 fork 根目录创建 patches/pageflip.patch（粘贴 azahar-pageflip.patch 内容）
+# 3. 在 fork 根目录创建 .github/workflows/build-windows-pageflip.yml（粘贴本文件）
+# 4. 进 Actions 页面 → Run workflow
+# 5. 等 1-3 小时下载 azahar-pageflip-windows.zip
 
 name: Build Windows (Page-Flip 3D)
 
@@ -13,7 +15,7 @@ on:
     tags: [ "*" ]
   pull_request:
     branches: [ "*" ]
-  workflow_dispatch:  # 允许手动触发
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -22,7 +24,7 @@ jobs:
   windows-msvc:
     name: Build Windows MSVC (with Page-Flip patch)
     runs-on: windows-latest
-    timeout-minutes: 240  # 4小时上限（首次编译约 2-3 小时）
+    timeout-minutes: 240
 
     steps:
       # 1. 拉取源码（含子模块）
@@ -53,13 +55,13 @@ jobs:
         shell: cmd
         run: |
           choco install -y ccache ninja ptime wget 7zip
-          echo C:\ProgramData\chocolatey\lib\ccache\tools\ccache\ccache.exe
 
-      # 5. 安装 Qt6（如果还没装）
+      # 5. 安装 Qt6
+      # 注：Qt 6.7+ 拆分 'qtbase' 为子模块，需改用 6.5.x 才能用 qtbase 模块名
       - name: Install Qt6
         uses: jurplel/install-qt-action@v4
         with:
-          version: '6.7.2'
+          version: '6.5.3'
           host: 'windows'
           target: 'desktop'
           arch: 'win64_msvc2019_64'
@@ -83,9 +85,9 @@ jobs:
             echo "Applying pageflip.patch..."
             git apply --check patches/pageflip.patch
             git apply patches/pageflip.patch
-            echo "✅ Patch applied successfully"
+            echo "Patch applied successfully"
           else
-            echo "❌ ERROR: patches/pageflip.patch not found!"
+            echo "ERROR: patches/pageflip.patch not found!"
             echo "Please put the patch file at patches/pageflip.patch"
             exit 1
           fi
@@ -96,6 +98,7 @@ jobs:
         run: git config --global core.autocrlf input
 
       # 9. CMake 配置
+      # jurplel/install-qt-action 会自动设置 Qt6_DIR 环境变量
       - name: Configure CMake
         shell: cmd
         run: |
@@ -103,7 +106,6 @@ jobs:
           cd build
           cmake .. -G Ninja ^
              -DCMAKE_BUILD_TYPE=Release ^
-             -DCMAKE_PREFIX_PATH=C:/Qt/6.7.2/msvc2019_64 ^
              -DENABLE_DISCORD_RPC=ON ^
              -DENABLE_QT=ON ^
              -DENABLE_SDL2=OFF
